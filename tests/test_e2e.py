@@ -1,0 +1,658 @@
+"""
+End-to-end tests for duroxide Python SDK — PostgreSQL backend.
+Ported from duroxide-node/__tests__/e2e.test.js
+
+Requires DATABASE_URL env var or .env file with a PostgreSQL connection string.
+SQLite smoketest at the bottom verifies basic functionality without PG.
+"""
+
+import json
+import os
+import time
+import threading
+import pytest
+
+from dotenv import load_dotenv
+
+from duroxide import (
+    SqliteProvider,
+    PostgresProvider,
+    Client,
+    Runtime,
+    PyRuntimeOptions,
+    PyPruneOptions,
+    PyInstanceFilter,
+)
+
+# Load .env from project root
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+SCHEMA = "duroxide_python_e2e"
+
+# ─── Helpers ─────────────────────────────────────────────────────
+
+RUN_ID = f"e2e{int(time.time() * 1000):x}"
+
+
+def uid(name):
+    return f"{RUN_ID}-{name}"
+
+
+@pytest.fixture(scope="module")
+def provider():
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        pytest.skip("DATABASE_URL not set")
+    return PostgresProvider.connect_with_schema(db_url, SCHEMA)
+
+
+def run_orchestration(provider, name, input, setup_fn, timeout_ms=10_000):
+    """Helper: register handlers, start runtime, run one orchestration, shutdown."""
+    client = Client(provider)
+    runtime = Runtime(provider, PyRuntimeOptions(dispatcher_poll_interval_ms=50))
+
+    setup_fn(runtime)
+    runtime.start()
+
+    try:
+        instance_id = uid(name)
+        client.start_orchestration(instance_id, name, input)
+        return client.wait_for_orchestration(instance_id, timeout_ms)
+    finally:
+        runtime.shutdown(100)
+
+
+# ─── 1. Hello World ──────────────────────────────────────────────
+
+
+def test_hello_world(provider):
+    def setup(rt):
+        @rt.register_activity("Hello")
+        def hello(ctx, input):
+            ctx.trace_info(f"greeting {input}")
+            return f"Hello, {input}!"
+
+        @rt.register_orchestration("HelloWorld")
+        def hello_world(ctx, input):
+            r1 = yield ctx.schedule_activity("Hello", "Rust")
+            ctx.trace_info(f"first greeting: {r1}")
+            r2 = yield ctx.schedule_activity("Hello", input)
+            return r2
+
+    result = run_orchestration(provider, "HelloWorld", "World", setup)
+    assert result.status == "Completed"
+    assert result.output == "Hello, World!"
+
+
+# ─── 2. Control Flow ─────────────────────────────────────────────
+
+
+def test_control_flow(provider):
+    def setup(rt):
+        rt.register_activity("GetFlag", lambda ctx, inp: "yes")
+        rt.register_activity("SayYes", lambda ctx, inp: "picked_yes")
+        rt.register_activity("SayNo", lambda ctx, inp: "picked_no")
+
+        @rt.register_orchestration("ControlFlow")
+        def control_flow(ctx, input):
+            flag = yield ctx.schedule_activity("GetFlag", "")
+            if flag == "yes":
+                return (yield ctx.schedule_activity("SayYes", ""))
+            else:
+                return (yield ctx.schedule_activity("SayNo", ""))
+
+    result = run_orchestration(provider, "ControlFlow", None, setup)
+    assert result.status == "Completed"
+    assert result.output == "picked_yes"
+
+
+# ─── 3. Loop ─────────────────────────────────────────────────────
+
+
+def test_loop(provider):
+    def setup(rt):
+        @rt.register_activity("Append")
+        def append(ctx, input):
+            ctx.trace_info(f'appending to "{input}"')
+            return f"{input}x"
+
+        @rt.register_orchestration("LoopOrchestration")
+        def loop_orch(ctx, input):
+            acc = "start"
+            for i in range(3):
+                acc = yield ctx.schedule_activity("Append", acc)
+                ctx.trace_info(f"iteration {i}: {acc}")
+            return acc
+
+    result = run_orchestration(provider, "LoopOrchestration", None, setup)
+    assert result.status == "Completed"
+    assert result.output == "startxxx"
+
+
+# ─── 4. Error Handling ───────────────────────────────────────────
+
+
+def test_error_handling(provider):
+    def setup(rt):
+        @rt.register_activity("Fragile")
+        def fragile(ctx, input):
+            ctx.trace_warn(f'fragile called with "{input}"')
+            if input == "bad":
+                raise Exception("boom")
+            return "ok"
+
+        rt.register_activity("Recover", lambda ctx, inp: "recovered")
+
+        @rt.register_orchestration("ErrorHandling")
+        def error_handling(ctx, input):
+            try:
+                return (yield ctx.schedule_activity("Fragile", "bad"))
+            except Exception as e:
+                ctx.trace_warn(f"fragile failed: {e}")
+                return (yield ctx.schedule_activity("Recover", ""))
+
+    result = run_orchestration(provider, "ErrorHandling", None, setup)
+    assert result.status == "Completed"
+    assert result.output == "recovered"
+
+
+# ─── 5. Timer ────────────────────────────────────────────────────
+
+
+def test_timer(provider):
+    def setup(rt):
+        rt.register_activity("AfterTimer", lambda ctx, inp: "done")
+
+        @rt.register_orchestration("TimerSample")
+        def timer_sample(ctx, input):
+            yield ctx.schedule_timer(100)
+            return (yield ctx.schedule_activity("AfterTimer", ""))
+
+    result = run_orchestration(provider, "TimerSample", None, setup)
+    assert result.status == "Completed"
+    assert result.output == "done"
+
+
+# ─── 6. Fan-out Fan-in (join) ────────────────────────────────────
+
+
+def test_fan_out_fan_in(provider):
+    def setup(rt):
+        @rt.register_activity("Greetings")
+        def greetings(ctx, input):
+            ctx.trace_info(f"building greeting for {input}")
+            return f"Hello, {input}!"
+
+        @rt.register_orchestration("FanOut")
+        def fan_out(ctx, input):
+            a = ctx.schedule_activity("Greetings", "Gabbar")
+            b = ctx.schedule_activity("Greetings", "Samba")
+            results = yield ctx.all([a, b])
+            vals = []
+            for r in results:
+                v = r.get("ok", r.get("err"))
+                if isinstance(v, str):
+                    try:
+                        v = json.loads(v)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                vals.append(v)
+            vals.sort()
+            return f"{vals[0]}, {vals[1]}"
+
+    result = run_orchestration(provider, "FanOut", None, setup)
+    assert result.status == "Completed"
+    assert result.output == "Hello, Gabbar!, Hello, Samba!"
+
+
+# ─── 7. System Activities (utcNow, newGuid) ──────────────────────
+
+
+def test_system_activities(provider):
+    def setup(rt):
+        @rt.register_orchestration("SystemActivities")
+        def sys_act(ctx, input):
+            now = yield ctx.utc_now()
+            guid = yield ctx.new_guid()
+            ctx.trace_info(f"now={now}, guid={guid}")
+            return {"now": now, "guid": guid}
+
+    result = run_orchestration(provider, "SystemActivities", None, setup)
+    assert result.status == "Completed"
+    assert result.output["now"] > 0
+    assert len(result.output["guid"]) == 36
+
+
+# ─── 8. Status Polling ───────────────────────────────────────────
+
+
+def test_status_polling(provider):
+    client = Client(provider)
+    runtime = Runtime(provider, PyRuntimeOptions(dispatcher_poll_interval_ms=50))
+
+    @runtime.register_orchestration("StatusSample")
+    def status_sample(ctx, input):
+        yield ctx.schedule_timer(50)
+        return "done"
+
+    runtime.start()
+
+    try:
+        instance_id = uid("status")
+        client.start_orchestration(instance_id, "StatusSample", None)
+        early = client.get_status(instance_id)
+        assert early.status in ("Running", "NotFound")
+        final = client.wait_for_orchestration(instance_id, 5000)
+        assert final.status == "Completed"
+        assert final.output == "done"
+    finally:
+        runtime.shutdown(100)
+
+
+# ─── 9. Sub-orchestration (basic) ────────────────────────────────
+
+
+def test_sub_orchestration_basic(provider):
+    def setup(rt):
+        rt.register_activity("Upper", lambda ctx, inp: inp.upper())
+
+        @rt.register_orchestration("ChildUpper")
+        def child_upper(ctx, input):
+            return (yield ctx.schedule_activity("Upper", input))
+
+        @rt.register_orchestration("Parent")
+        def parent(ctx, input):
+            r = yield ctx.schedule_sub_orchestration("ChildUpper", input)
+            val = r
+            if isinstance(val, str):
+                try:
+                    val = json.loads(val)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            return f"parent:{val}"
+
+    result = run_orchestration(provider, "Parent", "hi", setup)
+    assert result.status == "Completed"
+    assert result.output == "parent:HI"
+
+
+# ─── 10. Sub-orchestration Fan-out ───────────────────────────────
+
+
+def test_sub_orchestration_fan_out(provider):
+    def setup(rt):
+        @rt.register_activity("Add")
+        def add(ctx, input):
+            a, b = input.split(",")
+            return int(a) + int(b)
+
+        @rt.register_orchestration("ChildSum")
+        def child_sum(ctx, input):
+            return (yield ctx.schedule_activity("Add", input))
+
+        @rt.register_orchestration("ParentFan")
+        def parent_fan(ctx, input):
+            a = ctx.schedule_sub_orchestration("ChildSum", "1,2")
+            b = ctx.schedule_sub_orchestration("ChildSum", "3,4")
+            results = yield ctx.all([a, b])
+            total = 0
+            for r in results:
+                v = r.get("ok", r.get("err"))
+                if isinstance(v, str):
+                    try:
+                        v = json.loads(v)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                if isinstance(v, str):
+                    v = int(v)
+                total += v
+            return f"total={total}"
+
+    result = run_orchestration(provider, "ParentFan", None, setup)
+    assert result.status == "Completed"
+    assert result.output == "total=10"
+
+
+# ─── 11. Sub-orchestration Chained (3 levels) ────────────────────
+
+
+def test_sub_orchestration_chained(provider):
+    def setup(rt):
+        rt.register_activity("AppendX", lambda ctx, inp: f"{inp}x")
+
+        @rt.register_orchestration("Leaf")
+        def leaf(ctx, input):
+            return (yield ctx.schedule_activity("AppendX", input))
+
+        @rt.register_orchestration("Mid")
+        def mid(ctx, input):
+            r = yield ctx.schedule_sub_orchestration("Leaf", input)
+            val = r
+            if isinstance(val, str):
+                try:
+                    val = json.loads(val)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            return f"{val}-mid"
+
+        @rt.register_orchestration("Root")
+        def root(ctx, input):
+            r = yield ctx.schedule_sub_orchestration("Mid", input)
+            val = r
+            if isinstance(val, str):
+                try:
+                    val = json.loads(val)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            return f"root:{val}"
+
+    result = run_orchestration(provider, "Root", "a", setup)
+    assert result.status == "Completed"
+    assert result.output == "root:ax-mid"
+
+
+# ─── 12. External Event ──────────────────────────────────────────
+
+
+def test_external_event(provider):
+    client = Client(provider)
+    runtime = Runtime(provider, PyRuntimeOptions(dispatcher_poll_interval_ms=50))
+
+    @runtime.register_orchestration("WaitForApproval")
+    def wait_for_approval(ctx, input):
+        ctx.trace_info("Waiting for approval...")
+        event = yield ctx.wait_for_event("approval")
+        return {"approved": event}
+
+    runtime.start()
+
+    try:
+        instance_id = uid("event")
+        client.start_orchestration(instance_id, "WaitForApproval", None)
+        time.sleep(0.5)
+        client.raise_event(instance_id, "approval", {"status": "yes"})
+        result = client.wait_for_orchestration(instance_id, 10_000)
+        assert result.status == "Completed"
+        assert result.output == {"approved": {"status": "yes"}}
+    finally:
+        runtime.shutdown(100)
+
+
+# ─── 13. Continue-as-New ─────────────────────────────────────────
+
+
+def test_continue_as_new(provider):
+    def setup(rt):
+        @rt.register_orchestration("CanSample")
+        def can_sample(ctx, n):
+            if n < 3:
+                ctx.trace_info(f"CAN sample n={n} -> continue")
+                yield ctx.continue_as_new(n + 1)
+                return None
+            else:
+                return f"final:{n}"
+
+    result = run_orchestration(provider, "CanSample", 0, setup)
+    assert result.status == "Completed"
+    assert result.output == "final:3"
+
+
+# ─── 14. Cancellation ────────────────────────────────────────────
+
+
+def test_cancellation(provider):
+    client = Client(provider)
+    runtime = Runtime(provider, PyRuntimeOptions(dispatcher_poll_interval_ms=50))
+
+    @runtime.register_orchestration("LongRunning")
+    def long_running(ctx, input):
+        yield ctx.wait_for_event("never_arrives")
+        return "should not reach"
+
+    runtime.start()
+
+    try:
+        instance_id = uid("cancel")
+        client.start_orchestration(instance_id, "LongRunning", None)
+        time.sleep(0.5)
+        client.cancel_instance(instance_id, "user_request")
+        result = client.wait_for_orchestration(instance_id, 10_000)
+        assert result.status == "Failed"
+        assert result.error is not None
+    finally:
+        runtime.shutdown(100)
+
+
+# ─── 15. Conditional Logic ───────────────────────────────────────
+
+
+def test_conditional_logic(provider):
+    def setup(rt):
+        rt.register_activity("ProcessHigh", lambda ctx, inp: "high")
+        rt.register_activity("ProcessLow", lambda ctx, inp: "low")
+
+        @rt.register_orchestration("Conditional")
+        def conditional(ctx, input):
+            if input["value"] > input["threshold"]:
+                return (yield ctx.schedule_activity("ProcessHigh", input["value"]))
+            else:
+                return (yield ctx.schedule_activity("ProcessLow", input["value"]))
+
+    result = run_orchestration(
+        provider, "Conditional", {"threshold": 50, "value": 75}, setup
+    )
+    assert result.status == "Completed"
+    assert result.output == "high"
+
+
+# ─── 16. Activity Chain ──────────────────────────────────────────
+
+
+def test_activity_chain(provider):
+    def setup(rt):
+        rt.register_activity("AddOne", lambda ctx, inp: inp + 1)
+
+        @rt.register_orchestration("Chain")
+        def chain(ctx, input):
+            value = input
+            value = yield ctx.schedule_activity("AddOne", value)
+            value = yield ctx.schedule_activity("AddOne", value)
+            value = yield ctx.schedule_activity("AddOne", value)
+            return value
+
+    result = run_orchestration(provider, "Chain", 1, setup)
+    assert result.status == "Completed"
+    assert result.output == 4
+
+
+# ─── 17. Retry Policy ────────────────────────────────────────────
+
+
+def test_retry_policy(provider):
+    attempts = {"count": 0}
+
+    def setup(rt):
+        @rt.register_activity("Flaky")
+        def flaky(ctx, input):
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise Exception(f"attempt {attempts['count']} failed")
+            return "success"
+
+        @rt.register_orchestration("RetryTest")
+        def retry_test(ctx, input):
+            result = yield ctx.schedule_activity_with_retry(
+                "Flaky", None, {"max_attempts": 5, "backoff": "linear"}
+            )
+            return result
+
+    result = run_orchestration(provider, "RetryTest", None, setup)
+    assert result.status == "Completed"
+    assert result.output == "success"
+    assert attempts["count"] >= 3
+
+
+# ─── 18. Race / Select ───────────────────────────────────────────
+
+
+def test_race_activity_vs_timer(provider):
+    def setup(rt):
+        rt.register_activity("QuickWork", lambda ctx, inp: "quick_result")
+
+        @rt.register_orchestration("RaceTest")
+        def race_test(ctx, input):
+            winner = yield ctx.race(
+                ctx.schedule_activity("QuickWork", None),
+                ctx.schedule_timer(60000),
+            )
+            return winner
+
+    result = run_orchestration(provider, "RaceTest", None, setup)
+    assert result.status == "Completed"
+    output = result.output
+    assert output["index"] == 0  # activity wins
+
+
+# ─── 19. Versioned Orchestration ─────────────────────────────────
+
+
+def test_versioned_orchestration(provider):
+    def setup(rt):
+        rt.register_activity("Work", lambda ctx, inp: "done")
+
+        @rt.register_orchestration_versioned("VersionedOrch", "1.0.0")
+        def versioned_orch_v1(ctx, input):
+            return "v1"
+
+        @rt.register_orchestration_versioned("VersionedOrch", "1.0.1")
+        def versioned_orch_v2(ctx, input):
+            result = yield ctx.schedule_activity("Work", None)
+            return f"v2:{result}"
+
+    client = Client(provider)
+    runtime = Runtime(provider, PyRuntimeOptions(dispatcher_poll_interval_ms=50))
+    setup(runtime)
+    runtime.start()
+
+    try:
+        # Start with v1.0.0
+        id_v1 = uid("ver-v1")
+        client.start_orchestration_versioned(id_v1, "VersionedOrch", None, "1.0.0")
+        r1 = client.wait_for_orchestration(id_v1, 10_000)
+        assert r1.status == "Completed"
+        assert r1.output == "v1"
+
+        # Start with v1.0.1
+        id_v2 = uid("ver-v2")
+        client.start_orchestration_versioned(id_v2, "VersionedOrch", None, "1.0.1")
+        r2 = client.wait_for_orchestration(id_v2, 10_000)
+        assert r2.status == "Completed"
+        assert r2.output == "v2:done"
+    finally:
+        runtime.shutdown(100)
+
+
+# ─── 20. Join with mixed types (activity + timer) ────────────────
+
+
+def test_join_with_timer(provider):
+    def setup(rt):
+        rt.register_activity("QuickTask", lambda ctx, inp: "task_done")
+
+        @rt.register_orchestration("JoinTimer")
+        def join_timer(ctx, input):
+            results = yield ctx.all([
+                ctx.schedule_activity("QuickTask", None),
+                ctx.schedule_timer(100),
+            ])
+            # First result is activity (ok/err), second is timer (ok: null)
+            return {
+                "activity": results[0].get("ok"),
+                "timer": results[1].get("ok"),
+            }
+
+    result = run_orchestration(provider, "JoinTimer", None, setup)
+    assert result.status == "Completed"
+    # activity result is JSON-encoded string
+    activity_val = result.output["activity"]
+    if isinstance(activity_val, str):
+        try:
+            activity_val = json.loads(activity_val)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    assert activity_val == "task_done"
+    assert result.output["timer"] is None
+
+
+# ─── 21. Stop & Resume ──────────────────────────────────────────
+
+
+def test_stop_and_resume(provider):
+    """Orchestration started on one runtime can be completed by another."""
+    client = Client(provider)
+
+    # Phase 1: start and immediately shutdown
+    rt1 = Runtime(provider, PyRuntimeOptions(dispatcher_poll_interval_ms=50))
+
+    @rt1.register_activity("Tick")
+    def tick(ctx, inp):
+        return "ticked"
+
+    @rt1.register_orchestration("StopResume")
+    def stop_resume(ctx, input):
+        r = yield ctx.schedule_activity("Tick", None)
+        return f"done:{r}"
+
+    rt1.start()
+    instance_id = uid("stop-resume")
+    client.start_orchestration(instance_id, "StopResume", None)
+    rt1.shutdown(50)
+
+    # Phase 2: new runtime picks up the instance
+    rt2 = Runtime(provider, PyRuntimeOptions(dispatcher_poll_interval_ms=50))
+
+    @rt2.register_activity("Tick")
+    def tick2(ctx, inp):
+        return "ticked"
+
+    @rt2.register_orchestration("StopResume")
+    def stop_resume2(ctx, input):
+        r = yield ctx.schedule_activity("Tick", None)
+        return f"done:{r}"
+
+    rt2.start()
+    try:
+        result = client.wait_for_orchestration(instance_id, 10_000)
+        assert result.status == "Completed"
+        assert result.output == "done:ticked"
+    finally:
+        rt2.shutdown(100)
+
+
+# ─── SQLite Smoketest ────────────────────────────────────────────
+
+
+def test_sqlite_smoketest():
+    """Quick sanity check that SQLite provider still works."""
+    sqlite_provider = SqliteProvider.in_memory()
+    client = Client(sqlite_provider)
+    runtime = Runtime(sqlite_provider, PyRuntimeOptions(dispatcher_poll_interval_ms=50))
+
+    @runtime.register_activity("Echo")
+    def echo(ctx, inp):
+        return inp
+
+    @runtime.register_orchestration("SqliteSmoketest")
+    def sqlite_smoketest(ctx, input):
+        r = yield ctx.schedule_activity("Echo", input)
+        return r
+
+    runtime.start()
+    try:
+        instance_id = uid("sqlite-smoke")
+        client.start_orchestration(instance_id, "SqliteSmoketest", "hello-sqlite")
+        result = client.wait_for_orchestration(instance_id, 5_000)
+        assert result.status == "Completed"
+        assert result.output == "hello-sqlite"
+    finally:
+        runtime.shutdown(100)

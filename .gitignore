@@ -1,0 +1,36 @@
+# Rust
+/target/
+Cargo.lock
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.so
+*.dylib
+*.pyd
+
+# maturin
+*.whl
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# SQLite databases
+*.db
+*.sqlite
+
+# OS
+.DS_Store
+Thumbs.db

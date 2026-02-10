@@ -1,0 +1,21 @@
+[package]
+name = "duroxide-python"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "duroxide_python"
+crate-type = ["cdylib"]
+
+[dependencies]
+duroxide = { version = "0.1.17", features = ["sqlite"] }
+duroxide-pg = "0.1.19"
+pyo3 = { version = "0.23", features = ["extension-module"] }
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dotenvy = "0.15"
+
+[profile.release]
+lto = true
