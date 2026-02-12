@@ -132,6 +132,14 @@ instances = client.list_all_instances()
 info = client.get_instance_info("instance-1")
 tree = client.get_instance_tree("instance-1")
 
+# Execution history with full event data
+executions = client.list_executions("instance-1")
+events = client.read_execution_history("instance-1", executions[0])
+for event in events:
+    print(event.kind, event.data)
+    # event.kind: "OrchestrationStarted" | "ActivityCompleted" | ...
+    # event.data: JSON string with event-specific content (result, input, error, etc.)
+
 # Cleanup
 client.delete_instance("instance-1", force=True)
 client.prune_executions("instance-1", PyPruneOptions(keep_last=5))

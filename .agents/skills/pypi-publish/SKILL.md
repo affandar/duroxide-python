@@ -25,7 +25,7 @@ maturin develop --release
 ### 2. Tests Pass
 
 ```bash
-# All 49 tests must pass (requires DATABASE_URL in .env)
+# All 54 tests must pass (requires DATABASE_URL in .env)
 pytest -v
 ```
 
@@ -49,13 +49,13 @@ Update version in `pyproject.toml`:
 ```toml
 [project]
 name = "duroxide"
-version = "0.1.1"  # ← bump this
+version = "0.1.2"  # ← bump this
 ```
 
 Also update `Cargo.toml` version to match:
 ```toml
 [package]
-version = "0.1.1"
+version = "0.1.2"
 ```
 
 ## Build Platform Wheels
@@ -199,7 +199,7 @@ rm -rf /tmp/test-duroxide
 
 - [ ] `cargo clippy --all-targets` — zero warnings
 - [ ] `maturin develop --release` — clean build
-- [ ] `pytest -v` — all 49 tests pass
+- [ ] `pytest -v` — all 54 tests pass
 - [ ] `CHANGELOG.md` — updated for new version
 - [ ] `README.md` — links to CHANGELOG.md and docs
 - [ ] Version bumped in `pyproject.toml` + `Cargo.toml`

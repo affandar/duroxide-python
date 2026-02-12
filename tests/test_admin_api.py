@@ -213,6 +213,49 @@ def test_read_execution_history(provider):
     assert first_event.timestamp_ms > 0
 
 
+def test_read_execution_history_data(provider):
+    """Verify that event data is exposed in history events."""
+    def setup(rt):
+        rt.register_activity("reverse", lambda ctx, inp: {"reversed": True, **inp})
+
+        @rt.register_orchestration("HistoryDataTest")
+        def history_data_test(ctx, input):
+            return (yield ctx.schedule_activity("reverse", input))
+
+    client, result, instance_id = run_to_completion(
+        provider, "HistoryDataTest", {"greeting": "hello"}, setup
+    )
+
+    events = client.read_execution_history(instance_id, 1)
+
+    # OrchestrationStarted should have name, version, input
+    started = [e for e in events if e.kind == "OrchestrationStarted"][0]
+    assert started.data is not None, "OrchestrationStarted should have data"
+    import json
+    started_data = json.loads(started.data)
+    assert started_data["name"] == "HistoryDataTest"
+    assert started_data["input"] == {"greeting": "hello"}
+
+    # ActivityScheduled should have name and input
+    scheduled = [e for e in events if e.kind == "ActivityScheduled"][0]
+    assert scheduled.data is not None, "ActivityScheduled should have data"
+    sched_data = json.loads(scheduled.data)
+    assert sched_data["name"] == "reverse"
+
+    # ActivityCompleted should have the result
+    completed = [e for e in events if e.kind == "ActivityCompleted"][0]
+    assert completed.data is not None, "ActivityCompleted should have data"
+    completed_data = json.loads(completed.data)
+    assert completed_data["reversed"] is True
+    assert completed_data["greeting"] == "hello"
+
+    # OrchestrationCompleted should have output
+    orch_completed = [e for e in events if e.kind == "OrchestrationCompleted"][0]
+    assert orch_completed.data is not None, "OrchestrationCompleted should have data"
+    orch_data = json.loads(orch_completed.data)
+    assert orch_data["reversed"] is True
+
+
 # ─── 7. get_instance_tree ────────────────────────────────────────
 
 

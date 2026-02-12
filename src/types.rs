@@ -265,4 +265,6 @@ pub struct PyEvent {
     pub kind: String,
     pub source_event_id: Option<i64>,
     pub timestamp_ms: i64,
+    /// Event-specific data (activity result, input, error, timer fire_at, etc.)
+    pub data: Option<String>,
 }

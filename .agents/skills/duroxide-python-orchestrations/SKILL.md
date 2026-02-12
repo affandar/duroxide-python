@@ -261,8 +261,8 @@ def test_my_feature(provider):
 ```bash
 source .venv/bin/activate
 maturin develop                      # rebuild after Rust changes
-pytest -v                            # all 49 tests
-pytest tests/test_e2e.py -v          # e2e (22 tests)
+pytest -v                            # all 54 tests
+pytest tests/test_e2e.py -v          # e2e (27 tests)
 pytest tests/test_races.py -v        # race/join (7 tests)
 pytest tests/test_admin_api.py -v    # admin API (14 tests)
 pytest tests/scenarios/ -v           # scenario tests (6 tests)
