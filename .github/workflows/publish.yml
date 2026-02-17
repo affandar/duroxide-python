@@ -89,7 +89,6 @@ jobs:
       - name: List wheels
         run: ls -lh dist/
       - name: Publish to PyPI
-        uses: PyO3/maturin-action@v1
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          command: upload
-          args: --skip-existing dist/*
+          skip-existing: true
