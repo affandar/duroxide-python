@@ -60,6 +60,14 @@ fn extract_event_data(kind: &duroxide::EventKind) -> Option<String> {
         duroxide::EventKind::SubOrchestrationFailed { details } => {
             serde_json::to_string(details).ok()
         }
+        duroxide::EventKind::QueueSubscribed { name } => {
+            Some(format!(r#"{{"name":{}}}"#, serde_json::to_string(name).unwrap_or_default()))
+        }
+        duroxide::EventKind::QueueEventDelivered { name, data } => {
+            Some(format!(r#"{{"name":{},"data":{}}}"#,
+                serde_json::to_string(name).unwrap_or_default(),
+                data))
+        }
         _ => None,
     }
 }
@@ -217,6 +225,50 @@ impl PyClient {
             })
         })
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+
+    /// Enqueue an event into a named queue for an orchestration instance.
+    fn enqueue_event(
+        &self,
+        py: Python<'_>,
+        instance_id: String,
+        queue_name: String,
+        data: String,
+    ) -> PyResult<()> {
+        let client = self.inner.clone();
+        py.allow_threads(|| {
+            TOKIO_RT.block_on(async {
+                client
+                    .enqueue_event(&instance_id, &queue_name, data)
+                    .await
+                    .map_err(|e| format!("{e}"))
+            })
+        })
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+
+    /// Wait for custom status changes on an orchestration instance.
+    fn wait_for_status_change(
+        &self,
+        py: Python<'_>,
+        instance_id: String,
+        last_seen_version: u64,
+        poll_interval_ms: u64,
+        timeout_ms: u64,
+    ) -> PyResult<PyOrchestrationStatus> {
+        let client = self.inner.clone();
+        let poll_interval = Duration::from_millis(poll_interval_ms);
+        let timeout = Duration::from_millis(timeout_ms);
+        py.allow_threads(|| {
+            TOKIO_RT.block_on(async {
+                let status = client
+                    .wait_for_status_change(&instance_id, last_seen_version, poll_interval, timeout)
+                    .await
+                    .map_err(|e| format!("{e}"))?;
+                Ok(convert_status(status))
+            })
+        })
+        .map_err(|e: String| pyo3::exceptions::PyRuntimeError::new_err(e))
     }
 
     /// Get system metrics (if provider supports management).
@@ -546,21 +598,29 @@ fn convert_status(status: OrchestrationStatus) -> PyOrchestrationStatus {
             status: "NotFound".to_string(),
             output: None,
             error: None,
+            custom_status: None,
+            custom_status_version: 0,
         },
-        OrchestrationStatus::Running => PyOrchestrationStatus {
+        OrchestrationStatus::Running { custom_status, custom_status_version } => PyOrchestrationStatus {
             status: "Running".to_string(),
             output: None,
             error: None,
+            custom_status,
+            custom_status_version,
         },
-        OrchestrationStatus::Completed { output } => PyOrchestrationStatus {
+        OrchestrationStatus::Completed { output, custom_status, custom_status_version } => PyOrchestrationStatus {
             status: "Completed".to_string(),
             output: Some(output),
             error: None,
+            custom_status,
+            custom_status_version,
         },
-        OrchestrationStatus::Failed { details } => PyOrchestrationStatus {
+        OrchestrationStatus::Failed { details, custom_status, custom_status_version } => PyOrchestrationStatus {
             status: "Failed".to_string(),
             output: None,
             error: Some(details.display_message()),
+            custom_status,
+            custom_status_version,
         },
     }
 }

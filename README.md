@@ -15,6 +15,9 @@ Write durable workflows as Python generators. The Rust runtime handles replay, p
 - **Continue-as-new** — long-running orchestrations with bounded history
 - **Deterministic replay** — safe resume after crashes
 - **SQLite & PostgreSQL** — pluggable storage providers
+- **Custom Status** — `ctx.set_custom_status()` / `ctx.reset_custom_status()` for orchestration progress reporting, `client.wait_for_status_change()` for efficient polling
+- **Event Queues** — `ctx.dequeue_event(queue_name)` for FIFO mailbox-style message passing, `client.enqueue_event()` to send messages
+- **Retry on Session** — `ctx.schedule_activity_with_retry_on_session()` for retry with session affinity
 - **Admin APIs** — instance management, metrics, pruning
 - **Activity client access** — `ctx.get_client()` lets activities start new orchestrations
 - **Runtime metrics** — `metrics_snapshot()` for orchestration/activity counters
@@ -89,6 +92,12 @@ def my_workflow(ctx, input):
         ctx.schedule_timer(10000),
     )
 
+    # Custom status (fire-and-forget, no yield)
+    ctx.set_custom_status("processing complete")
+
+    # Dequeue from event queue (FIFO, blocks until message available)
+    msg = yield ctx.dequeue_event("inbox")
+
     return {"result": result, "winner": winner}
 ```
 
@@ -143,6 +152,50 @@ for event in events:
 # Cleanup
 client.delete_instance("instance-1", force=True)
 client.prune_executions("instance-1", PyPruneOptions(keep_last=5))
+```
+
+## Custom Status
+
+Report orchestration progress visible to external clients:
+
+```python
+@runtime.register_orchestration("ProgressWorkflow")
+def progress_workflow(ctx, input):
+    ctx.set_custom_status("step 1: validating")
+    yield ctx.schedule_activity("Validate", input)
+
+    ctx.set_custom_status("step 2: processing")
+    result = yield ctx.schedule_activity("Process", input)
+
+    ctx.reset_custom_status()  # clear status
+    return result
+
+# Poll for status changes from outside
+status = client.wait_for_status_change("instance-1", 0, 50, 10000)
+if status:
+    print(status.custom_status)          # "step 1: validating"
+    print(status.custom_status_version)  # monotonically increasing counter
+```
+
+## Event Queues
+
+Persistent FIFO message passing between clients and orchestrations:
+
+```python
+@runtime.register_orchestration("ChatBot")
+def chat_bot(ctx, input):
+    msg_json = yield ctx.dequeue_event("inbox")
+    msg = json.loads(msg_json)
+    response = yield ctx.schedule_activity("Generate", msg["text"])
+    ctx.set_custom_status(json.dumps({"state": "replied", "response": response, "seq": msg["seq"]}))
+    if "bye" in msg["text"].lower():
+        return f"Done after {msg['seq']} msgs"
+    return (yield ctx.continue_as_new(""))
+
+# Send messages from outside
+client.enqueue_event(instance_id, "inbox", json.dumps({"seq": 1, "text": "Hello!"}))
+status = client.wait_for_status_change(instance_id, 0, 50, 10000)
+reply = json.loads(status.custom_status)
 ```
 
 ## Development

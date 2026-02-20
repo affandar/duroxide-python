@@ -12,6 +12,8 @@ import json
 
 from duroxide._duroxide import (
     orchestration_trace_log,
+    orchestration_set_custom_status,
+    orchestration_reset_custom_status,
     activity_trace_log,
     activity_is_cancelled,
 )
@@ -81,6 +83,29 @@ class OrchestrationContext:
             },
         }
 
+    def schedule_activity_with_retry_on_session(
+        self, name: str, input, retry: dict, session_id: str
+    ) -> dict:
+        """Schedule an activity with retry policy and session affinity. Yield the return value.
+
+        All retry attempts are pinned to the same session_id, ensuring they
+        execute on the same worker.
+        """
+        return {
+            "type": "activityWithRetryOnSession",
+            "name": name,
+            "input": json.dumps(input),
+            "retry": {
+                "maxAttempts": retry.get("max_attempts", retry.get("maxAttempts", 3)),
+                "timeoutMs": retry.get("timeout_ms", retry.get("timeoutMs")),
+                "totalTimeoutMs": retry.get(
+                    "total_timeout_ms", retry.get("totalTimeoutMs")
+                ),
+                "backoff": retry.get("backoff"),
+            },
+            "sessionId": session_id,
+        }
+
     def schedule_timer(self, delay_ms: int) -> dict:
         """Schedule a timer (delay in milliseconds). Yield the return value."""
         return {"type": "timer", "delayMs": delay_ms}
@@ -88,6 +113,18 @@ class OrchestrationContext:
     def wait_for_event(self, name: str) -> dict:
         """Wait for an external event. Yield the return value."""
         return {"type": "waitEvent", "name": name}
+
+    def dequeue_event(self, queue_name: str) -> dict:
+        """Dequeue the next message from a named event queue (FIFO mailbox semantics).
+
+        Unlike wait_for_event, queued events use FIFO matching:
+        - Events that arrive before a subscription are buffered until consumed
+        - Events survive continue_as_new boundaries
+        - The caller enqueues messages with client.enqueue_event()
+
+        Yield the return value.
+        """
+        return {"type": "dequeueEvent", "queueName": queue_name}
 
     def schedule_sub_orchestration(self, name: str, input=None) -> dict:
         """Schedule a sub-orchestration. Yield the return value."""
@@ -184,6 +221,24 @@ class OrchestrationContext:
     def race(self, *tasks) -> dict:
         """Select/race multiple tasks (wait for first). Yield the return value."""
         return {"type": "select", "tasks": list(tasks)}
+
+    # ─── Custom Status (fire-and-forget, delegates to Rust ctx) ──
+
+    def set_custom_status(self, status: str):
+        """Set a custom status string on this orchestration instance.
+
+        Fire-and-forget — no yield needed. Last write per turn wins.
+        Persistent across turns: if you don't call it on a later turn,
+        the provider keeps the previous value.
+        """
+        orchestration_set_custom_status(self.instance_id, str(status))
+
+    def reset_custom_status(self):
+        """Clear the custom status back to None.
+
+        Fire-and-forget — no yield needed.
+        """
+        orchestration_reset_custom_status(self.instance_id)
 
     # ─── Logging (fire-and-forget, delegates to Rust ctx.trace()) ───
 

@@ -330,7 +330,164 @@ print(result.output)  # ["a", "b", "c"]
 runtime.shutdown()
 ```
 
-## Activity Patterns
+## Custom Status — Orchestration Progress Reporting
+
+Custom status lets orchestrations report progress visible to external clients. Status updates are fire-and-forget (no `yield` needed) and survive replays.
+
+### Setting Custom Status
+
+```python
+@runtime.register_orchestration("ProvisionServer")
+def provision_server(ctx, input):
+    ctx.set_custom_status("validating configuration")
+    yield ctx.schedule_activity("ValidateConfig", input)
+
+    ctx.set_custom_status("creating VM")
+    vm = yield ctx.schedule_activity("CreateVM", input)
+
+    ctx.set_custom_status("installing software")
+    yield ctx.schedule_activity("InstallSoftware", vm)
+
+    ctx.reset_custom_status()  # clear status when done
+    return {"vm_id": vm["id"]}
+```
+
+### Polling for Status Changes
+
+Use `client.wait_for_status_change()` for efficient status polling — it blocks until the status version changes or the timeout expires:
+
+```python
+# Start orchestration
+client.start_orchestration("prov-1", "ProvisionServer", config)
+
+# Poll for status changes
+last_version = 0
+while True:
+    result = client.wait_for_status_change("prov-1", last_version, 50, 10000)
+    if result is None:
+        break  # timeout — orchestration may have completed
+    print(f"Status: {result.custom_status}")
+    last_version = result.custom_status_version
+```
+
+**Parameters:**
+- `instance_id` — the orchestration instance to watch
+- `last_seen_version` — the version you last saw (0 to start); returns when version exceeds this
+- `poll_interval_ms` — how often to poll the provider
+- `timeout_ms` — max time to wait before returning `None`
+
+**OrchestrationResult fields:**
+- `result.custom_status` — the custom status string, or `None` if not set
+- `result.custom_status_version` — monotonically increasing version counter
+
+## Event Queues — Persistent FIFO Message Passing
+
+Event queues provide durable, ordered message passing between external clients and orchestrations. Unlike `wait_for_event()` which waits for a single named event, event queues support FIFO ordering with multiple messages on named queues. Messages survive `continue_as_new`.
+
+### Dequeuing Events in Orchestrations
+
+```python
+@runtime.register_orchestration("RequestProcessor")
+def request_processor(ctx, input):
+    # Block until a message arrives on the "requests" queue
+    request_json = yield ctx.dequeue_event("requests")
+    request = json.loads(request_json)
+
+    result = yield ctx.schedule_activity("ProcessRequest", request)
+    return result
+```
+
+### Enqueuing Events from Clients
+
+```python
+client.enqueue_event("proc-1", "requests", json.dumps({
+    "action": "process",
+    "data": {"id": 42},
+}))
+```
+
+### Multiple Queues
+
+Orchestrations can dequeue from different named queues:
+
+```python
+@runtime.register_orchestration("MultiQueue")
+def multi_queue(ctx, input):
+    # Each queue is independent — FIFO within each queue
+    command = yield ctx.dequeue_event("commands")
+    config = yield ctx.dequeue_event("config")
+    return {"command": command, "config": config}
+```
+
+## Retry on Session — Retry with Session Affinity
+
+`schedule_activity_with_retry_on_session` combines retry policies with session affinity — all retry attempts are pinned to the same worker session:
+
+```python
+@runtime.register_orchestration("RetrySessionWorkflow")
+def retry_session_workflow(ctx, input):
+    result = yield ctx.schedule_activity_with_retry_on_session(
+        "FlakeyGpuTask",
+        input,
+        {"max_attempts": 3, "backoff_strategy": "none"},
+        "gpu-session-1",
+    )
+    return result
+```
+
+This is useful when the activity relies on in-memory state (e.g., a loaded ML model or GPU context) that would be lost if retries landed on a different worker.
+
+## Real-World Example: Copilot Chat Bot
+
+This pattern combines event queues, custom status, and continue-as-new to build an interactive chat bot that processes messages one at a time:
+
+```python
+import json
+
+@runtime.register_activity("Generate")
+def generate(ctx, text):
+    # Call an LLM or generate a response
+    return f"Echo: {text}"
+
+@runtime.register_orchestration("ChatBot")
+def chat_bot(ctx, input):
+    # Wait for next message on the "inbox" queue
+    msg_json = yield ctx.dequeue_event("inbox")
+    msg = json.loads(msg_json)
+
+    # Process the message
+    response = yield ctx.schedule_activity("Generate", msg["text"])
+
+    # Report the response via custom status
+    ctx.set_custom_status(json.dumps({
+        "state": "replied",
+        "response": response,
+        "seq": msg["seq"],
+    }))
+
+    # Exit on "bye", otherwise loop
+    if "bye" in msg["text"].lower():
+        return f"Done after {msg['seq']} msgs"
+
+    # Restart with fresh history (messages survive continue-as-new)
+    return (yield ctx.continue_as_new(""))
+
+# --- Client side ---
+
+# Start the chat bot
+client.start_orchestration("chat-1", "ChatBot", "")
+
+# Send a message
+client.enqueue_event("chat-1", "inbox", json.dumps({"seq": 1, "text": "Hello!"}))
+
+# Wait for the response
+status = client.wait_for_status_change("chat-1", 0, 50, 10000)
+reply = json.loads(status.custom_status)
+print(reply["response"])  # "Echo: Hello!"
+
+# End the conversation
+client.enqueue_event("chat-1", "inbox", json.dumps({"seq": 2, "text": "Bye!"}))
+```
 
 ### Basic Activity
 
@@ -498,12 +655,20 @@ client.start_orchestration_versioned("id", "WorkflowName", input_data, "1.0.2")
 # Wait for completion (with timeout in ms)
 result = client.wait_for_orchestration("id", 30000)
 # result.status: "Completed" | "Failed" | "Running" | "Terminated" | ...
+# result.custom_status: custom status string or None
+# result.custom_status_version: monotonically increasing version counter
 
 # Cancel a running orchestration
 client.cancel_instance("id", "reason")
 
 # Raise an event
 client.raise_event("id", "event_name", event_data)
+
+# Enqueue event to a named queue (FIFO, survives continue-as-new)
+client.enqueue_event("id", "queue_name", data_string)
+
+# Poll for custom status changes
+status = client.wait_for_status_change("id", last_seen_version, poll_interval_ms, timeout_ms)
 
 # Get status without waiting
 status = client.get_status("id")

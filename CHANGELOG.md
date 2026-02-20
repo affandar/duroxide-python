@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-02-15
+
+### Added
+- **Custom Status documentation** — user guide and architecture docs for `ctx.set_custom_status()`, `ctx.reset_custom_status()`, and `client.wait_for_status_change()`
+- **Event Queues documentation** — user guide and architecture docs for `ctx.dequeue_event()` and `client.enqueue_event()`
+- **Retry on Session documentation** — user guide docs for `ctx.schedule_activity_with_retry_on_session()`
+- **Copilot Chat pattern** — real-world example combining event queues, custom status, and continue-as-new for interactive chat bots
+- Updated README with custom status, event queues, and retry-on-session API examples
+
+### Changed
+- Bumped `duroxide` dependency to 0.1.19
+
+### Deprecated
+- `client.raise_event_persistent()` — use `client.enqueue_event()` instead
+- `ctx.schedule_wait_persistent()` — use `ctx.dequeue_event()` instead
+
+## [0.1.7] - 2026-02-14
+
+### Added
+- **Custom Status API** — `ctx.set_custom_status(status)` and `ctx.reset_custom_status()` for setting/clearing custom status from within orchestrations (fire-and-forget, no yield needed)
+- **Custom Status on OrchestrationResult** — `custom_status` and `custom_status_version` fields now available on all status results (`get_status`, `wait_for_orchestration`, `wait_for_status_change`)
+- **`client.wait_for_status_change(instance_id, last_seen_version, poll_interval_ms, timeout_ms)`** — polls for custom status changes on an orchestration instance
+- **Event Queue API** — `ctx.dequeue_event(queue_name)` for FIFO mailbox-style event consumption in orchestrations, paired with `client.enqueue_event(instance_id, queue_name, data)` for sending messages
+- **`ctx.schedule_activity_with_retry_on_session(name, input, retry, session_id)`** — retry with session affinity (all attempts pinned to the same worker)
+- Queue event kinds (`QueueSubscribed`, `QueueEventDelivered`) now included in `read_execution_history` event data
+
+### Changed
+- Bumped `duroxide` dependency to 0.1.19
+- Bumped `duroxide-pg` dependency to 0.1.21
+
 ## [0.1.6] - 2026-02-13
 
 ### Added

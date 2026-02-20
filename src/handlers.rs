@@ -112,6 +112,22 @@ pub fn orchestration_trace(instance_id: &str, level: &str, message: &str) {
     }
 }
 
+/// Called from Python to set custom status on the OrchestrationContext.
+pub fn orchestration_set_custom_status(instance_id: &str, status: &str) {
+    let map = ORCHESTRATION_CTXS.lock().unwrap();
+    if let Some(ctx) = map.get(instance_id) {
+        ctx.set_custom_status(status);
+    }
+}
+
+/// Called from Python to reset (clear) custom status on the OrchestrationContext.
+pub fn orchestration_reset_custom_status(instance_id: &str) {
+    let map = ORCHESTRATION_CTXS.lock().unwrap();
+    if let Some(ctx) = map.get(instance_id) {
+        ctx.reset_custom_status();
+    }
+}
+
 // ─── Activity Bridge ─────────────────────────────────────────────
 
 /// Wraps a Python callable as a Rust ActivityHandler.
@@ -369,6 +385,25 @@ impl PyOrchestrationHandler {
                     Err(e) => TaskResult::Err(e),
                 }
             }
+            ScheduledTask::DequeueEvent { queue_name } => {
+                let data = ctx.dequeue_event(&queue_name).await;
+                TaskResult::Ok(data)
+            }
+            ScheduledTask::ActivityWithRetryOnSession {
+                name,
+                input,
+                retry,
+                session_id,
+            } => {
+                let policy = convert_retry_policy(&retry);
+                match ctx
+                    .schedule_activity_with_retry_on_session(&name, input, policy, &session_id)
+                    .await
+                {
+                    Ok(val) => TaskResult::Ok(val),
+                    Err(err) => TaskResult::Err(err),
+                }
+            }
             ScheduledTask::Join { tasks } => {
                 for t in &tasks {
                     match t {
@@ -531,6 +566,24 @@ fn make_select_future(
                 Err(e) => e,
             }
         }),
+        ScheduledTask::DequeueEvent { queue_name } => {
+            Box::pin(async move { ctx.dequeue_event(&queue_name).await })
+        }
+        ScheduledTask::ActivityWithRetryOnSession {
+            name,
+            input,
+            retry,
+            session_id,
+        } => Box::pin(async move {
+            let policy = convert_retry_policy(&retry);
+            match ctx
+                .schedule_activity_with_retry_on_session(&name, input, policy, &session_id)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => e,
+            }
+        }),
         _ => Box::pin(async { "unsupported task in select".to_string() }),
     }
 }
@@ -622,6 +675,25 @@ fn make_join_future(
         } => Box::pin(async move {
             match ctx
                 .schedule_sub_orchestration_versioned_with_id(&name, version, instance_id, input)
+                .await
+            {
+                Ok(v) => serde_json::json!({ "ok": v }).to_string(),
+                Err(e) => serde_json::json!({ "err": e }).to_string(),
+            }
+        }),
+        ScheduledTask::DequeueEvent { queue_name } => Box::pin(async move {
+            let data = ctx.dequeue_event(&queue_name).await;
+            serde_json::json!({ "ok": data }).to_string()
+        }),
+        ScheduledTask::ActivityWithRetryOnSession {
+            name,
+            input,
+            retry,
+            session_id,
+        } => Box::pin(async move {
+            let policy = convert_retry_policy(&retry);
+            match ctx
+                .schedule_activity_with_retry_on_session(&name, input, policy, &session_id)
                 .await
             {
                 Ok(v) => serde_json::json!({ "ok": v }).to_string(),

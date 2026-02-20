@@ -24,6 +24,8 @@ from duroxide._duroxide import (
     PyEvent,
     activity_trace_log,
     orchestration_trace_log,
+    orchestration_set_custom_status,
+    orchestration_reset_custom_status,
     activity_is_cancelled,
     init_tracing,
 )
@@ -43,10 +45,12 @@ _orchestration_functions: dict = {}
 class OrchestrationResult:
     """Wrapper for orchestration status with parsed output."""
 
-    def __init__(self, status, output=None, error=None):
+    def __init__(self, status, output=None, error=None, custom_status=None, custom_status_version=0):
         self.status = status
         self.output = output
         self.error = error
+        self.custom_status = custom_status
+        self.custom_status_version = custom_status_version
 
 
 def _parse_status(raw):
@@ -61,6 +65,8 @@ def _parse_status(raw):
         status=raw.status,
         output=output,
         error=raw.error,
+        custom_status=raw.custom_status,
+        custom_status_version=raw.custom_status_version,
     )
 
 
@@ -133,12 +139,40 @@ class Client:
         result = self._native.wait_for_orchestration(instance_id, timeout_ms)
         return _parse_status(result)
 
+    def wait_for_status_change(
+        self,
+        instance_id: str,
+        last_seen_version: int = 0,
+        poll_interval_ms: int = 200,
+        timeout_ms: int = 30000,
+    ):
+        """Wait for custom status changes on an orchestration instance.
+
+        Polls until the custom_status_version changes from last_seen_version,
+        or the orchestration reaches a terminal state.
+
+        Returns an OrchestrationResult with custom_status and custom_status_version.
+        """
+        result = self._native.wait_for_status_change(
+            instance_id, last_seen_version, poll_interval_ms, timeout_ms
+        )
+        return _parse_status(result)
+
     def cancel_instance(self, instance_id: str, reason: str = None):
         self._native.cancel_instance(instance_id, reason)
 
     def raise_event(self, instance_id: str, event_name: str, data=None):
         self._native.raise_event(
             instance_id, event_name, json.dumps(data)
+        )
+
+    def enqueue_event(self, instance_id: str, queue_name: str, data=None):
+        """Enqueue an event into a named queue for an orchestration instance.
+
+        Uses FIFO mailbox semantics. Matched by ctx.dequeue_event() in the orchestration.
+        """
+        self._native.enqueue_event(
+            instance_id, queue_name, json.dumps(data)
         )
 
     def get_system_metrics(self):

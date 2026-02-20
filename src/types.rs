@@ -77,6 +77,19 @@ pub enum ScheduledTask {
         input: String,
         version: Option<String>,
     },
+    #[serde(rename = "dequeueEvent")]
+    DequeueEvent {
+        #[serde(rename = "queueName")]
+        queue_name: String,
+    },
+    #[serde(rename = "activityWithRetryOnSession")]
+    ActivityWithRetryOnSession {
+        name: String,
+        input: String,
+        retry: RetryPolicyConfig,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
     #[serde(rename = "join")]
     Join { tasks: Vec<ScheduledTask> },
     #[serde(rename = "select")]
@@ -117,6 +130,8 @@ pub struct PyOrchestrationStatus {
     pub status: String,
     pub output: Option<String>,
     pub error: Option<String>,
+    pub custom_status: Option<String>,
+    pub custom_status_version: u64,
 }
 
 /// System metrics returned to Python.

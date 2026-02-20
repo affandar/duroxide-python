@@ -308,3 +308,91 @@ PyO3/maturin compiles to a platform-specific `.so`/`.dylib`/`.pyd` binary. Cross
 ### Single GIL
 
 All Python callbacks (generator steps, activity functions) run under the GIL. The Rust runtime is multi-threaded (tokio), but Python execution is single-threaded due to the GIL. Heavy computation in activities will block other Python callbacks. This is no different from standard Python threading.
+
+## Custom Status Data Path
+
+Custom status is a fire-and-forget side channel that orchestrations use to report progress. Unlike `yield`-based operations, `set_custom_status()` does not produce a history event — it writes directly to the instance metadata in the provider.
+
+```
+Python                              Rust (PyO3)                        Provider (DB)
+──────                              ───────────                        ─────────────
+ctx.set_custom_status("step 2")
+  │
+  └─► orchestration_set_custom_status(instance_id, "step 2")
+        │
+        └─► ORCHESTRATION_CTXS.get(instance_id)
+              │
+              └─► ctx.set_custom_status("step 2")
+                    │
+                    └─► provider.update_custom_status(id, status, version+1)
+
+ctx.reset_custom_status()           Same path, sets status to None
+```
+
+**Client polling:**
+
+```
+Python                              Rust (PyO3)                        Provider (DB)
+──────                              ───────────                        ─────────────
+client.wait_for_status_change(id, last_version, poll_ms, timeout_ms)
+  │
+  └─► py.allow_threads(|| {
+        TOKIO_RT.block_on(async {
+          loop {
+            status = provider.get_status(id)
+            if status.custom_status_version > last_version:
+              return Some(status)
+            if elapsed > timeout_ms:
+              return None
+            sleep(poll_ms)
+          }
+        })
+      })
+```
+
+The `custom_status_version` is a monotonically increasing counter incremented on every `set_custom_status()` call. Clients pass their last-seen version to avoid redundant reads.
+
+## Event Queue Data Flow
+
+Event queues provide persistent FIFO message passing between external clients and orchestrations. Unlike `wait_for_event()` which matches a single named event, event queues support multiple messages on named queues with guaranteed ordering. Messages survive `continue_as_new`.
+
+### Enqueue (client → provider)
+
+```
+Python                              Rust (PyO3)                        Provider (DB)
+──────                              ───────────                        ─────────────
+client.enqueue_event(id, "inbox", data)
+  │
+  └─► py.allow_threads(|| {
+        TOKIO_RT.block_on(async {
+          client.enqueue_event(id, "inbox", data).await
+        })
+      })
+            │
+            └─► INSERT into event queue table (instance_id, queue_name, data, seq)
+                Enqueue orchestrator work item (wake up the orchestration)
+```
+
+### Dequeue (orchestration ← provider)
+
+```
+Python (generator)                  Rust (handler loop)                Provider (DB)
+──────────────────                  ───────────────────                ─────────────
+yield ctx.dequeue_event("inbox")
+  │
+  └─► {"type": "dequeueEvent", "queue_name": "inbox"}
+        │
+        └─► execute_task(ctx, task)
+              │
+              └─► ctx.dequeue_event("inbox")  → DurableFuture
+                    │
+                    ├─ First run: subscribe to queue, block until message arrives
+                    │    provider.dequeue_event(id, "inbox") → data
+                    │
+                    └─ Replay: return cached result from history
+                         (QueueSubscribed + QueueEventDelivered events)
+```
+
+### Continue-as-New Semantics
+
+When an orchestration calls `continue_as_new()`, pending queue messages are preserved. The new execution picks up where the old one left off — messages are not lost or redelivered. This enables the "eternal orchestration with mailbox" pattern used in chat bots and actor-style workflows.
