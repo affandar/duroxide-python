@@ -1,3 +1,11 @@
+# ⚠️ This repository has moved
+
+**This repo has been relocated to [microsoft/duroxide-python](https://github.com/microsoft/duroxide-python).**
+
+All future development will happen there. This repository is archived and will no longer receive updates.
+
+---
+
 # duroxide-python
 
 Python SDK for the [Duroxide](https://github.com/affandar/duroxide) durable execution runtime.
